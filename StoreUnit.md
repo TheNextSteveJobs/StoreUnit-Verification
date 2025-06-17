@@ -6,73 +6,84 @@
 
 ## 术语说明
 
-
-
-
 | 名称 | 定义 |
 | ------- | ---|
-| TLB（Translation Lookaside Buffer） | 描述1 |
-| PMP（Physical Memory Protection）	| 描述2 |
-| 概念名1	| 描述3 |
+| TLB（Translation Lookaside Buffer） | 地址转换旁路缓冲器，用于虚拟地址到物理地址的快速转换 |
+| PMP（Physical Memory Protection）	| 物理内存访问权限检查机制 |
+| RAW（Read After Write）违例	| 写后读违例，表示一个load指令读取尚未写入的store数据 |
+| LSQ（Load Store Queue） | 处理Load/Store指令顺序及依赖检查的数据结构 |
+| StoreQueue | 专门用于跟踪Store指令的FIFO队列 |
 
-## 前置知识【可选项】
+## 前置知识
 
-在阅读文档或进行验证之前，建议掌握一些关键前置知识，以便更深入理解相关内容。例如，在撰写LoadStoreQueue（LSQ）文档时，讲述RAW（Read After Write）违例有助于理解操作之间的依赖关系。在撰写Icache或L2Cache文档时，介绍缓存层级、替换策略和一致性模型等基本概念也有助于读者理解。如果涉及复杂算法，也应对其进行简要描述。
-
-基本要求：
-1. 该部分内容应简洁，易于理解。如篇幅较长，可将内容移至附录。
-2. 针对较为复杂的内容，可以通过图像、伪代码和案例进行解释，以降低理解难度。
-
-
-## 整体框图 【可选项】 若模块含多个子模块或复杂数据流，需提供框图辅助说明
-
-可使用Visio/Draw.io等工具绘制，导出为PNG/SVG格式；
-需标注关键信号流向；
-框图中子模块命名需与“子模块列表”章节严格一致。
-
-## 流水级示意图 【可选项】 若为复杂流水线型模块，需说明各级流水功能与时序关系
-
-可使用Visio/Draw.io等工具绘制，导出为PNG/SVG格式；
-涉及到的模块名称需要保持一致性
-重要数据除了列出名称以外，还需要标明位宽等信息
-
-## 子模块列表 【可选项】 若模块由多个子模块组成，需在此列出
-
-以下是IFU top文档中的一个示例：
-
-| 子模块                 | 描述                |
-| ---------------------- | ------------------- |
-| [子模块1](子模块1文档位置) | 子模块1描述       |
-| [子模块2](子模块2文档位置) | 子模块2描述       |
-| [子模块3](子模块3文档位置) | 子模块3描述       |
+在阅读本模块文档前，建议掌握以下知识：
+1. RISC-V中的Store指令地址流水线与语义；
+2. 虚拟地址与物理地址的映射机制；
+3. 异常与中断系统，尤其是地址不对齐异常、页面异常；
+4. 向量指令中store语义与mask机制。
 
 
 <mrs-functions>
 
-## 功能说明 【必填项】 需按功能树形式逐级分解，每个功能点需对应后续测试点。
+## 功能说明
 
-请用<mrs-functions></functions>包裹整个“模块功能说明”部分。
+### 1. 支持标量Store指令
 
-采用X.Y.Z多级编号（如1.2.3表示主功能1→子功能2→测试点3，也可以继续细分）
+#### 1.1 地址计算与对齐检查（S0）
+- 输入：来自store issue队列的指令
+- 处理：
+  - 计算虚拟地址（VA）
+  - 检查地址是否对齐，并标记`storeAddrMisaligned`
+  - 发起TLB请求（`io.tlb.req`）
+  - 生成mask，输出到StoreQueue
+- 输出：`st_mask_out`
 
-功能描述需明确输入条件、处理过程、输出结果
+#### 1.2 TLB与RAW违例处理（S1）
+- 输入：TLB响应（`io.tlb.resp`）
+- 处理：
+  - 将TLB响应写入StoreQueue
+  - 向LoadQueue发出RAW检测
+  - 如果TLB命中，则向后端发出issue信息（`io.issue`）
 
-### 1. 功能A说明
-针对功能A分解测试点
+#### 1.3 异常与反馈更新（S2）
+- 输入：PMP检查结果（`io.pmp`）
+- 处理：
+  - 异常信号更新至ROB
+  - 将TLB miss反馈发送至RS（`feedback_slow`）
+  - 将其他信息写入LSQ
 
-如果测试点较多可以先列一个小表格
+#### 1.4 同步一拍（S3）
+- 处理：用于与RAW违例检测对齐同步
 
-### 2. 功能B说明
+#### 1.5 发起写回（S4）
+- 输出：
+  - 普通store结果写回后端（`stout`）
 
-针对功能B分解测试点
+### 2. 支持向量Store指令
 
-如果测试点较多可以先列一个小表格
+#### 2.1 接收vsSplit请求（S0）
+- 来自VecStIn通道（`io.vecstin`），高优先级，无需地址计算
 
-### 3. 功能C说明
+#### 2.2 计算向量偏移（S1）
+- 计算vecVaddrOffset、vecTriggerMask
+- 向LSQ写入store数据
 
-针对功能C分解测试点
+#### 2.3 忽略feedback（S2）
+- 不需要向后端RS发送反馈信息
 
-如果测试点较多可以先列一个小表格；针对每个测试点，给出设置cov_group的建议
+#### 2.4 发起向量写回（S4）
+- 输出：向量store结果写回（`vecstout`）
+
+### 3. 支持非对齐Store指令
+
+#### 3.1 非对齐请求处理（S0）
+- 来自MisalignBuffer（`misalign_stin`），优先级最高
+
+#### 3.2 判断是否进入MisalignBuffer（S2）
+- 如果是新请求且未对齐但不跨16B边界，则进入MisalignBuffer（`misalign_enq`）
+- 如果来自MisalignBuffer：
+  - TLB miss则重发（`misalign_stout`）
+  - 否则发起写回
 
 </mrs-functions>
 
@@ -81,39 +92,50 @@
 
 
 | 常量名 | 常量值 | 解释 |
-| ---- | ---- | ---- |
-| 常量1 | 64 | 常量1解释 |
-| 常量2 | 8 | 常量2解释 |
-| 常量3 | 16 | 常量3解释 |
+| ------ | ------ | ---- |
+| VAddrBits | 39 | 虚拟地址位宽 |
+| XLEN | 64 | 数据位宽 |
+| VLEN | 512 | 向量长度 |
+| RAWTotalDelayCycles | 1 | RAW违例处理延迟周期 |
 
 
 ## 接口说明 【必填项】 详细解释各种接口的含义、来源
 
-信号按功能（如时钟复位、数据输入、控制信号等）或来源（其他模块）分组；
+### 输入接口
+| 信号名 | 方向 | 位宽 | 描述 |
+|--------|------|------|------|
+| clock | input | 1 | 时钟信号 |
+| reset | input | 1 | 复位信号 |
+| io.redirect | input | 11 | 异常重定向信息（含robIdx等） |
+| io.csrCtrl | input | CustomCSRCtrlIO | CSR控制信号集 |
+| io.stin | input | 100 | 普通标量store请求输入 |
+| io.vecstin | input | Decoupled(VecPipeBundle) | 向量store请求输入 |
+| io.misalign_stin | input | Decoupled(LsPipelineBundle) | 非对齐store请求输入 |
+| io.prefetch_req | input | Decoupled(StorePrefetchReq) | 预取store请求 |
+| io.vec_isFirstIssue | input | 1 | 向量store是否第一次发射 |
+| io.fromCsrTrigger | input | CsrTriggerBundle | CSR触发器调试控制输入 |
 
-可以将一些同质的信号一起解释；
-
-特殊协议信号需注明时序要求（如AXI的VALID/READY握手）。
-
-使用时，请将下面的接口组名称和说明替换为符合您模块实际意义的内容
-
-### 接口组1说明
-
-请在这里填充接口组1的说明
-
-#### 接口组1_1说明
-
-请在这里填充接口组1_1的说明
-
-如果不能细分，请进一步说明该组中所有接口
-
-### 接口组2说明
-
-请在这里填充接口组2的说明
-
-如果不能细分，请进一步说明该组中所有接口
-
-...
+### 输出接口
+| 信号名 | 方向 | 位宽 | 描述 |
+|--------|------|------|------|
+| io.issue | output | Valid(MemExuInput) | 发出到后端的issue信息 |
+| io.misalign_stout | output | Valid(SqWriteBundle) | 非对齐store请求写回响应 |
+| io.tlb | mixed | TlbRequestIO | 地址转换请求与响应接口（含req/resp） |
+| io.dcache | mixed | DCacheStoreIO | DCache store接口（含req/resp/kill等） |
+| io.pmp | input | PMPRespBundle | PMP权限检查反馈 |
+| io.lsq | output | Valid(LsPipelineBundle) | 向LoadStoreQueue发送普通store结果 |
+| io.lsq_replenish | output | LsPipelineBundle | 向LSQ发送异常或补充信息 |
+| io.feedback_slow | output | Valid(RSFeedback) | 向调度器发送TLB miss等信息 |
+| io.prefetch_train | output | Valid(LsPrefetchTrainBundle) | 向SMS训练路径反馈 |
+| io.s1_prefetch_spec | output | 1 | Stage1是否为预取投机路径 |
+| io.s2_prefetch_spec | output | 1 | Stage2是否为预取投机路径 |
+| io.stld_nuke_query | output | Valid(StoreNukeQueryBundle) | RAW违例检测接口 |
+| io.stout | output | Decoupled(MemExuOutput) | 写回结果（标量store） |
+| io.vecstout | output | Decoupled(VecPipelineFeedbackIO) | 写回结果（向量store） |
+| io.st_mask_out | output | Valid(StoreMaskBundle) | 输出store掩码mask给StoreQueue使用 |
+| io.debug_ls | output | DebugLsInfoBundle | debug信息输出 |
+| io.misalign_enq | output | MisalignBufferEnqIO | 向MisalignBuffer发起入队或撤销请求 |
+| io.s0_s1_valid | output | 1 | Stage0或Stage1是否活跃，用于RAW检测同步 |
 
 ## 接口时序 【可选项】 对复杂接口，提供波形图的案例
 
@@ -133,13 +155,13 @@
 
 | 序号 |  功能名称 | 测试点名称      | 描述                  |
 | ----- |-----------------|---------------------|------------------------------------|
-| 1\.1\.1 | FUNCTION_1_1 | TESTPOINT_A | 功能1\.1的测试点A，使用时请替换为您的测试点的输入输出和判断方法 |
-| 1\.1\.2 | FUNCTION_1_1 | TESTPOINT_B | 功能1\.1的测试点B，使用时请替换为您的测试点的输入输出和判断方法 |
-| 1\.1\.3 | FUNCTION_1_1 | TESTPOINT_C | 功能1\.1的测试点C，使用时请替换为您的测试点的输入输出和判断方法 |
-| 1\.2\.1 | FUNCTION_1_2 | TESTPOINT_X | 功能1\.2的测试点X，使用时请替换为您的测试点的输入输出和判断方法 |
-| 1\.2\.2 | FUNCTION_1_2 | TESTPOINT_Y | 功能1\.2的测试点Y，使用时请替换为您的测试点的输入输出和判断方法 |
-| 2\.1 | FUNCTION_2 | TESTPOINT_2A | 功能2的测试点2A，使用时请替换为您的测试点的输入输出和判断方法 |
-| 2\.2 | FUNCTION_2 | TESTPOINT_2B | 功能2的测试点2B，使用时请替换为您的测试点的输入输出和判断方法 |
+| 1.1.1 | SCALAR_STORE | TEST_ADDR_ALIGN | 检查地址对齐时是否正确发出TLB请求 |
+| 1.2.1 | SCALAR_STORE | TEST_TLB_HIT | 检查DTLB命中时是否向后端发起issue |
+| 1.3.1 | SCALAR_STORE | TEST_FEEDBACK | 检查PMP检查结果是否正确反馈至RS |
+| 2.1.1 | VECTOR_STORE | TEST_VEC_OFFSET | 检查向量指令计算偏移是否正确 |
+| 2.4.1 | VECTOR_STORE | TEST_VEC_WRITEBACK | 检查vecstout是否正确写回 |
+| 3.2.1 | MISALIGN_STORE | TEST_MISALIGN_ENTRY | 检查未对齐请求是否进入MisalignBuffer |
+| 3.2.2 | MISALIGN_STORE | TEST_MISALIGN_REPLAY | 检查TLB miss后是否正确重发 |
 
 </mrs-testpoints>
 

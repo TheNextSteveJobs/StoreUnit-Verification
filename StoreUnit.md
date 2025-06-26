@@ -525,13 +525,11 @@
 
 ## 接口时序
 
-### 案例1
+### 整体框图
 
-请在这里填充时序案例1
+(LSU-StoreUnit-Timing.svg)
 
-### 案例2
 
-请在这里填充时序案例2
 
 ## 测试点总表
 
@@ -539,13 +537,28 @@
 
 | 序号 |  功能名称 | 测试点名称      | 描述                  |
 | ----- |-----------------|---------------------|------------------------------------|
-| 1.1.1 | SCALAR_STORE | TEST_ADDR_ALIGN | 检查地址对齐时是否正确发出TLB请求 |
-| 1.2.1 | SCALAR_STORE | TEST_TLB_HIT | 检查DTLB命中时是否向后端发起issue |
-| 1.3.1 | SCALAR_STORE | TEST_FEEDBACK | 检查PMP检查结果是否正确反馈至RS |
-| 2.1.1 | VECTOR_STORE | TEST_VEC_OFFSET | 检查向量指令计算偏移是否正确 |
-| 2.4.1 | VECTOR_STORE | TEST_VEC_WRITEBACK | 检查vecstout是否正确写回 |
-| 3.2.1 | MISALIGN_STORE | TEST_MISALIGN_ENTRY | 检查未对齐请求是否进入MisalignBuffer |
-| 3.2.2 | MISALIGN_STORE | TEST_MISALIGN_REPLAY | 检查TLB miss后是否正确重发 |
+| 1.1.1 | ADDRESS_CALC_ALIGNMENT | VA_CALCULATION       | 测试store指令是否能正确计算虚拟地址（VA）。                           |
+| 1.1.2 | ADDRESS_CALC_ALIGNMENT | ALIGNMENT_CHECK      | 测试地址对齐检查是否能正确识别对齐与非对齐地址。                     |
+| 1.1.3 | ADDRESS_CALC_ALIGNMENT | TLB_REQUEST          | 测试是否能正确发起TLB请求（io.tlb.req）。                            |
+| 1.1.4 | ADDRESS_CALC_ALIGNMENT | MASK_GENERATION      | 测试mask是否正确生成并输出至StoreQueue。                             |
+| 1.1.5 | ADDRESS_CALC_ALIGNMENT | ST_MASK_OUT          | 测试st_mask_out信号是否被正确输出。                                  |
+| 1.2.1 | TLB_RAW_VIOLATION      | TLB_RESPONSE         | 测试TLB响应是否正确写入StoreQueue。                                  |
+| 1.2.2 | TLB_RAW_VIOLATION      | RAW_DETECTION        | 测试是否能正确检测到RAW违例并发出相关信号。                          |
+| 1.2.3 | TLB_RAW_VIOLATION      | ISSUE_SIGNAL         | 测试TLB命中时是否能正确发出issue信号（io.issue）。                  |
+| 1.3.1 | EXCEPTION_FEEDBACK     | PMP_EXCEPTION        | 测试PMP检查结果是否能正确更新至ROB。                                 |
+| 1.3.2 | EXCEPTION_FEEDBACK     | TLB_MISS_FEEDBACK    | 测试TLB miss反馈是否正确发送至RS（feedback_slow）。                  |
+| 1.3.3 | EXCEPTION_FEEDBACK     | LSQ_UPDATE           | 测试是否能将其他相关信息正确写入LSQ。                                |
+| 1.4.1 | SYNCHRONIZATION        | RAW_SYNC             | 测试与RAW违例检测的同步是否正常进行。                                |
+| 1.5.1 | WRITEBACK              | STORE_WRITEBACK      | 测试store结果是否能正确写回后端（stout）。                          |
+| 2.1.1 | VECTOR_STORE           | VECSTIN_REQUEST      | 测试是否能正确接收来自VecStIn通道的请求。                           |
+| 2.2.1 | VECTOR_STORE           | VECTOR_OFFSET_CALC   | 测试向量偏移是否能正确计算（`vecVaddrOffset`和`vecTriggerMask`）。   |
+| 2.2.2 | VECTOR_STORE           | LSQ_WRITE            | 测试是否能将store数据正确写入LSQ。                                   |
+| 2.3.1 | VECTOR_STORE           | FEEDBACK_IGNORE      | 测试是否忽略向后端RS发送的反馈信息。                                 |
+| 2.4.1 | VECTOR_STORE           | VECSTORE_WRITEBACK   | 测试向量store结果是否能正确写回（`vecstout`）。                     |
+| 3.1.1 | MISALIGN_STORE         | MISALIGN_REQUEST     | 测试MisalignBuffer是否能正确处理非对齐请求。                         |
+| 3.2.1 | MISALIGN_STORE         | MISALIGN_BUFFER_ENTRY| 测试非对齐请求是否会正确进入MisalignBuffer（未跨16B边界的请求）。    |
+| 3.2.2 | MISALIGN_STORE         | MISALIGN_TLB_MISS    | 测试MisalignBuffer中的请求在TLB miss时是否会重新发起请求。          |
+| 3.2.3 | MISALIGN_STORE         | MISALIGN_WRITEBACK   | 测试MisalignBuffer中的请求是否能正确发起写回。                       |
 
 </mrs-testpoints>
 

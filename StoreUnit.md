@@ -525,7 +525,7 @@
 
 ## 接口时序
 
-### 整体框图
+### 接口时序实例
 
 ![StoreUnit接口时序](LSU-StoreUnit-Timing.svg)
 

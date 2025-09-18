@@ -1,7 +1,10 @@
-# StoreUnit模块验证文档
+# StoreUnit
+#### 本文档参考[香山StoreUnit设计文档](https://github.com/OpenXiangShan/XiangShan-Design-Doc/blob/master/docs/en/memblock/LSU/StoreUnit.md)写成
+请注意，本文档撰写的测试点仅供参考，如能补充更多测试点，最终获得的奖励可能更高！
+# StoreUnit说明文档
 ## 文档概述
-
-本文档描述了StoreUnit模块的结构与功能，并根据功能给出测试点参考，方便测试的参与者理解测试需求，编写相关测试用例。StoreUnit包括其五级流水线处理流程、支持的三种类型store指令（标量、向量、非对齐）、接口设计与信号交互逻辑。该模块用于执行Store类指令的地址生成与处理，是Load/Store流水线中的关键组成部分。
+本文档描述了StoreUnit的结构与功能，并根据功能给出测试点参考，方便测试的参与者理解测试需求，编写相关测试用例。
+StoreUnit 是存储指令执行单元 ，由多个协同工作的子模块组成，包括其五级流水线处理流程、支持的三种类型store指令（标量、向量、非对齐）、接口设计与信号交互逻辑。该模块用于执行Store类指令的地址生成与处理，是Load/Store流水线中的关键组成部分。
 
 
 ## 术语说明
@@ -11,79 +14,239 @@
 | TLB（Translation Lookaside Buffer） | 地址转换旁路缓冲器，用于虚拟地址到物理地址的快速转换 |
 | PMP（Physical Memory Protection）	| 物理内存访问权限检查机制 |
 | RAW（Read After Write）违例	| 写后读违例，表示一个load指令读取尚未写入的store数据 |
-| LSQ（Load Store Queue） | 处理Load/Store指令顺序及依赖检查的数据结构 |
-| StoreQueue | 专门用于跟踪Store指令的FIFO队列 |
+| MMIO（Memory-Mapped Input/Output） | 内存映射IO |
 
-## 前置知识
+### 存储指令执行
 
-在阅读本模块文档前，建议掌握以下知识：
-1. RISC-V中的Store指令地址流水线与语义；
-2. 虚拟地址与物理地址的映射机制；
-3. 异常与中断系统，尤其是地址不对齐异常、页面异常；
-4. 向量指令中store语义与mask机制。
+内存单元里包含2条Store地址流水线与2条Store数据流水线。各流水线独立接收并执行对应发射队列派发的指令。
 
+#### 存储地址流水线
+
+![Scalar](scalar.png)
+
+由4级结构组成：
+
+​Store地址流水线（4级结构）​​
+
+* stage 0:
+
+    * 计算VA地址
+    
+    * 非对齐 > 向量 > 标量请求的优先级仲裁
+
+    * 地址非对齐检查更新到uop.exceptionVec
+    
+    * 对地址的16字节边界检测
+
+    * 发出DTLB读请求到tlb
+
+    * 更新指令的掩码信息到s0_mask_out发送到StoreQueue
+
+    * 判断是否为数据宽度为128bits的store指令。
+
+* stage 1:
+
+    * 接收TLB地址转换响应，TLB若缺失则重试
+    
+    * 查询LoadQueueRAW以进行违规检查
+ 
+    * 与加载单元s1和s2阶段的Load指令进行RAW冒险检测
+
+    * 如果DTLB hit，将store issue信息发送到后端
+
+* stage 2:
+
+    * mmio/PMP检查、检查原子操作权限
+    
+    * 更新storeQueue中标记为地址就绪状态
+
+    * 更新DTLB结果通过feedback_slow更新到后端
+
+* stage 3:
+
+    * 标量store发起写回，通过stout发送给后端
+    
+    * StoreQueue条目释放与状态清理
+
+#### 存储数据流水线
+
+- 从发射队列（issue queue）接收数据
+- 将数据写回StoreQueue
+- 标记发射队列接收的数据为就绪状态
+
+### 向量存储指令执行
+对于除 SEG指令外的向量内存访问指令，VSSplit 负责接收向量内存访问指令发射队列发送的微操作（uop），并将该微操作拆分为多个元素。随后VSSplit 将这些元素发送至StoreUnit 执行，执行流程与标量内存访问指令相同。执行完成后，元素会被写回至 VSMerge，其中 Merge 模块会将这些元素收集并组合成微操作，最终写回向量寄存器文件。
+SEG 指令则由独立的 VSegmentUnit 模块处理。
+
+![Vector](vector.png)
+
+StoreUnit处理非对齐Store指令流程和标量类似，特别的:
+
+* stage 0:
+
+    * 接受vsSplit的执行请求，优先级高于标量请求,并且不需要计算虚拟地址
+
+* stage 1:
+
+    * 计算vecVaddrOffset和vecTriggerMask
+
+* stage 2:
+
+    * 不需要向后端发送feedback_slow响应
+
+* stage 3:
+
+    * 向量store发起Writeback，通过vecstout发送给后端
+
+### 非对齐存储指令执行
+
+香山核支持标量与向量内存指令对存储空间进行非对齐访问。
+
+标量非对齐访问未跨越16B边界时可正常执行，无需特殊处理，而跨越16B边界的标量非对齐内存访问在MisalignBuffer中拆分为两次对齐内存操作，完成后由MisalignBuffer处理拼接与写回。
+
+向量非Segment的Unit-stride指令访问连续地址空间，合并元素后一次访问16B，因此无需特殊处理。
+
+非Unit-stride的非Segment向量指令由VSplit模块完成元素拆分与地址计算后发送至流水线。若元素非对齐则发送至MisalignBuffer，后续过程与非对齐标量相同，区别在于MisalignBuffer最终写回至VMerge而非直接后端
+
+向量Segment指令的非对齐处理由VSegmentUnit独立完成，不复用标量内存访问路径，通过独立状态机完成
+
+原子指令、MMIO与NC地址空间均不支持非对齐访问，这些情况将触发AccessFault异常。
+
+![Misalign](misalign.png)
+
+StoreUnit处理非对齐Store指令流程和标量类似，特别的:
+
+* stage 0:
+
+  * 接受来自StoreMisalignBuffer的请求，优先级高于向量和标量请求,并且不需要计算虚拟地址
+
+* stage 2:
+
+  * 不需要向后端发送feedback响应
+
+  * 如果不是来自于StoreMisalignBuffer的请求并且没有跨越16字节边界的非对齐请求，那么需要进入StoreMisalignBuffer处理
+
+    * 通过io_misalign_buf接口，向StoreMisalignBuffer发送入队请求
+
+  * 如果是来自与StoreMisalignBuffer的请求并且没有跨越16字节边界请求，则需要向StoreMisliagnBuffer发送重发或者写回响应
+
+    * 通过io_misalign_sout接口，向StoreMisalignBuffer发送响应
+
+    * 如果出现TLB miss，则需要重发，否则写回
+
+###  RAW违例
+RAW内存违例：处理器核执行的Load指令的结果应来源于当前处理器核观察到的全局内存顺序中最新的写操作。具体而言，若最新的写操作来自当前核的Store指令，则Load应获取该Store写入的数据。为优化Load指令性能，超标量乱序处理器会投机执行Loads。因此，Load指令可能早于地址相同的更早Store执行，从而获取到该Store之前的旧值，即构成RAW内存违例。
+
+## 整体框图及流水级
+
+Store指令地址流水线分为S0/S1/S2/S3四级,如图所示：
+
+![StoreUnit整体框图](StoreUnit.png)
+
+接收store地址发射队列发来的请求，处理完成之后需要给后端和向量部分响应，处理过程中需要给发射队列反馈信息，给StoreQueue反馈信息，最后写回, 如果中间出现异常则从发射队列重新发射。
 
 <mrs-functions>
 
-## 功能说明
+## StoreUnit功能说明
+StoreUnit是存储指令的逻辑，功能被解构并集成到了 ​Memory Dispatch Queue、STA、STD、Integer ALUs、StoreQueue、SBuffer、LoadQueueRAW/RAR以及 DTLB​ 等一系列子模块中。
 
-### 1. 支持标量Store指令
+###  1. 内存指令派发
+Store指令存在复杂的控制机制（如顺序、转发、违例等），因此需要队列来保存Store指令的先进先出顺序以进行相关控制，该队列即StoreQueue。Store指令在完成译码、重命名等操作后，需要派发至ROB与LSQ，分配对应的robIdx、lqIdx与sqIdx，随后进入各自发射队列。在所有源操作数就绪后发射至MemBlock中的流水线。在MemBlock中的执行生命周期内，Store指令会携带lqIdx与sqIdx，用于内存违例检测与数据转发时的顺序维护。
 
-#### 1.1 地址计算与对齐检查（S0）
-- 输入：来自store issue队列的指令
-- 处理：
-  - 计算虚拟地址（VA）
-  - 检查地址是否对齐，并标记`storeAddrMisaligned`
-  - 发起TLB请求（`io.tlb.req`）
-  - 生成mask，输出到StoreQueue
-- 输出：`s0_mask_out`
+对于标量内存访问指令，一条指令分配一个StoreQueue表项。
 
-#### 1.2 TLB与RAW违例处理（S1）
-- 输入：TLB响应（`io.tlb.resp`）
-- 处理：
-  - 将TLB响应写入StoreQueue
-  - 向LoadQueue发出RAW检测
-  - 如果TLB命中，则向后端发出issue信息（`io.issue`）
+对于向量内存访问指令，一条指令在译码阶段会被拆分为多个uop，每个uop包含若干元素，相当于一次内存访问操作。在派发时，一个uop会分配与其包含元素数量相等的多个LSQ表项。
 
-#### 1.3 异常与反馈更新（S2）
-- 输入：PMP检查结果（`io.pmp`）
-- 处理：
-  - 异常信号更新至ROB
-  - 将TLB miss反馈发送至RS（`feedback_slow`）
-  - 将其他信息写入LSQ
+| 序号 |  功能名称 | 测试点名称      | 描述                  |
+| ----- |-----------------|---------------------|------------------------------------|
+| 1.1 | SU_DISPATCH | SCALAR_DISPATCH  | 验证标量Store指令派发时分配一个StoreQueue条目。|
+| 1.2 |SU_DISPATCH | VECTOR_DISPATCH | 验证向量Store指令的一个uop分配多个LSQ条目（根据元素数量）。|
 
-#### 1.4 同步一拍（S3）
-- 处理：用于与RAW违例检测对齐同步
+### 2. 地址流水线
 
-#### 1.5 发起写回（S4）
-- 输出：
-  - 普通store结果写回后端（`stout`）
+| 序号 |  功能名称 | 测试点名称      | 描述                  |
+| ----- |-----------------|---------------------|------------------------------------|
+| 2.1 | SU_STORE  | S0_ADDRESS_CALC |验证s0阶段地址计算和仲裁。|
+| 2.2 | SU_STORE  | S1_RAW_CHECK|验证s1阶段RAW冒险检测。|
+| 2.3 | SU_STORE  | S2_SQ_MARK_READY |验证s2阶段StoreQueue地址就绪标记。|
 
-### 2. 支持向量Store指令
+### 3. 向量内存指令执行
 
-#### 2.1 接收vsSplit请求（S0）
-- 来自VecStIn通道（`io.vecstin`），高优先级，无需地址计算
+| 序号 |  功能名称 | 测试点名称      | 描述                  |
+| ----- |-----------------|---------------------|------------------------------------|
+| 3.1 | SU_VECTOR  | SPLIT |验证向量指令拆分正确性。|
+| 3.2 | SU_VECTOR  | OFFSET |元素偏移计算|
 
-#### 2.2 计算向量偏移（S1）
-- 计算vecVaddrOffset、vecTriggerMask
-- 向LSQ写入store数据
 
-#### 2.3 忽略feedback（S2）
-- 不需要向后端RS发送反馈信息
+### 4. 重执行​
 
-#### 2.4 发起向量写回（S4）
-- 输出：向量store结果写回（`vecstout`）
+存储指令会被发射队列重新传输，在一个存储指令被发射队列发射后，队列不会立即清除该指令，直到StoreUnit返回信号。StoreUnit根据TLB是否命中发送相应反馈。如果TLB未命中，则由指令发射队列负责重新发送该指令。
 
-### 3. 支持非对齐Store指令
+### 5. RAW处理
+RAW内存访问违例检测：LoadQueue中的LoadQueueRAW模块通过FreeList结构记录所有可能地址相同但尚未执行更早Store的Load指令。当Load指令在LoadUnit执行到s2阶段（此时地址转换与PMA/PMP检查已完成）时，会分配LoadQueueRAW表项。当StoreQueue中所有Store地址就绪后，LoadQueueRAW中的所有Load可释放；或当程序顺序早于它的所有Store地址就绪后，该Load可从LoadQueueRAW释放。若Store指令在查询LoadQueueRAW时发现存在地址相同的更晚Load，则发生RAW内存访问违例，需要回滚。
 
-#### 3.1 非对齐请求处理（S0）
-- 来自MisalignBuffer（`misalign_stin`），优先级最高
+RAW内存访问违例恢复：检测到RAW违例时，由LoadQueueRAW发起回滚，从造成违例的Store指令的下一条指令开始清空流水线。
 
-#### 3.2 判断是否进入MisalignBuffer（S2）
-- 如果是新请求且未对齐但不跨16B边界，则进入MisalignBuffer（`misalign_enq`）
-- 如果来自MisalignBuffer：
-  - TLB miss则重发（`misalign_stout`）
-  - 否则发起写回
+| 序号 |  功能名称 | 测试点名称      | 描述 |
+| ----- |-----------------|---------------------|------------------------------------|
+| 5.1 | SU_RAW  | VIOLATION |验证RAW违例检测。|
+| 5.2 | SU_RAW  | RECOVERY_MECH |验证检测到RAW违例后的恢复（流水线清空）。|
+
+### 6. SBuffer优化
+根据RVWMO模型，在多核场景下（无FENCE等栅栏语义指令时），一个核的Store指令可以比地址不同的更晚Load指令更晚对其他核可见。该内存模型规则主要优化Store指令性能。RVWMO等弱一致性模型允许处理器核包含SBuffer，暂时保存已提交的Store写操作，合并这些写操作后再写入DCache，从而减少Store指令对DCache SRAM端口的争用，提高Load指令执行带宽。
+
+SBuffer为16×512B的全相联结构。当多个Store地址落在同一缓存块时，SBuffer会合并这些Store。
+
+SBuffer每周期最多可写入2条Store指令，每条Store指令写数据位宽为16B（例外：cbo.zero指令按缓存块操作，一次操作一个缓存块）。
+
+SBuffer换出：
+
+当SBuffer容量超过一定阈值时，执行换出操作，按PLRU替换算法选择被替换块写入DCache
+
+SBuffer支持被动清空机制；FENCE/atomic/向量Segment等指令执行时会清空SBuffer
+
+SBuffer支持超时清空机制；超过2^20周期未被换出的数据块将被驱逐
+
+| 序号 |  功能名称 | 测试点名称      | 描述  |
+| ----- |-----------------|---------------------|------------------------------------|
+| 6.1 | SU_SBUFFER  | WRITE_MERGE|验证同一缓存块的多个Store在SBuffer中合并。|
+| 6.2 | SU_SBUFFER  | 	PLRU_REPLACE |验证SBuffer满时按PLRU策略替换。|
+
+### 7. MMIO处理
+香山核仅允许标量内存访问指令访问MMIO地址空间。MMIO访问与任何其他内存操作强顺序。因此，MMIO指令必须等待成为ROB头（即所有前序指令均完成）时才能执行。对于MMIO Store指令，需完成虚地址到实地址转换，通过实地址检查，且写数据就绪。随后LSQ将内存请求发送至Uncache模块，通过总线访问外设。结果返回LSQ后写回至ROB。
+
+原子指令与向量指令不支持MMIO访问。若此类指令访问MMIO地址空间，将触发对应AccessFault异常。
+| 序号 |  功能名称 | 测试点名称      | 描述 |
+| ----- |-----------------|---------------------|------------------------------------|
+| 7.1 | SU_MMIO  | ORDER |验证MMIO指令强顺序执行（成为ROB头）。|
+| 7.2 | SU_MMIO  | EXCEPTION |验证原子/向量指令访问MMIO触发异常。|
+
+### 8. Uncache指令执行
+香山核除支持访问非幂等、强顺序的MMIO地址空间外，还支持访问幂等、弱一致性（RVWMO）的Non-cacheable地址空间，简称NC。软件通过页表PBMT字段配置为NC以覆盖原有PMA属性。与MMIO访问不同，NC访问允许乱序内存操作。
+
+在StoreUnit流水线中被识别为NC地址（PBMT = NC）的内存访问指令会在LSQ中标记。LSQ负责将NC访问发送至Uncache模块。Uncache支持同时处理多个NC请求，支持请求合并，并负责向正在LoadUnit执行的NC Load转发Stores。
+
+| 序号 |  功能名称 | 测试点名称      | 描述|
+| ----- |-----------------|---------------------|------------------------------------|
+| 8.1 | SU_NC | EXEC |验证NC访问允许乱序执行。|
+| 8.2 | SU_NC  | FORWARD |验证Uncache模块的Store到Load转发。|
+
+### 9. 非对齐内存访问
+
+| 序号 |  功能名称 | 测试点名称      | 描述  |
+| ----- |-----------------|---------------------|------------------------------------|
+| 9.1 | SU_MISALIGN  | SCALAR_SPLIT |验证标量非对齐访问跨越16B边界时拆分为两个对齐访问。|
+| 9.2 | SU_MISALIGN  | SEG_HANDLE |验证向量Segment指令的非对齐处理（独立路径）。|
+| 9.3 | SU_MISALIGN  | EXCEPTION |验证原子指令、MMIO、NC空间非对齐访问触发异常。|
+
+### 10. 原子指令执行
+香山核支持RVA与Zacas指令集。香山当前设计中，原子指令需先将访问的缓存块缓存至DCache，再进行原子操作。
+
+内存访问单元监控Store发射队列发射的地址与数据，若为原子指令则进入AtomicsUnit。AtomicsUnit执行一系列操作，包括TLB地址转换、清空SBuffer、访问DCache等。
+| 序号 |  功能名称 | 测试点名称      | 描述  |
+| ----- |-----------------|---------------------|------------------------------------|
+| 10.1 | SU_ATOMIC  | PRELOAD |验证原子指令先将缓存块读入DCache。|
+| 10.2 | SU_ATOMIC  | OPS |验证原子操作（如AMO）执行正确性。|
 
 </mrs-functions>
 
@@ -91,12 +254,16 @@
 ## 常量说明
 
 
-| 常量名 | 常量值 | 解释 |
-| ------ | ------ | ---- |
-| VAddrBits | 50 | 虚拟地址位宽 |
-| XLEN | 64 | 数据位宽 |
-| VLEN | 128 | 向量长度 |
-| RAWTotalDelayCycles | 1 | RAW违例处理延迟周期 |
+| 常量名 | 常量值 |
+| ------ | ------ |
+| VAddrBits | (Sv39) 39, (Sv48) 48 |
+| GPAddr Bits | (Sv39x4) 41, (Sv48x4) 50 |
+| StoreExeUnit | 2 |
+| StoreUnit | 2 x 8B/16B |
+| StoreQueue | 56 |
+| StoreBuffer | 16 x 64B |
+| VSMergeBuffer | 16 |
+| Store TLB | 48项全相联 |
 
 
 ## 接口说明
@@ -537,31 +704,27 @@
 
 | 序号 |  功能名称 | 测试点名称      | 描述                  |
 | ----- |-----------------|---------------------|------------------------------------|
-| 1.1.1 | ADDRESS_CALC_ALIGNMENT | VA_CALCULATION       | 测试store指令是否能正确计算虚拟地址（VA）。                           |
-| 1.1.2 | ADDRESS_CALC_ALIGNMENT | ALIGNMENT_CHECK      | 测试地址对齐检查是否能正确识别对齐与非对齐地址。                     |
-| 1.1.3 | ADDRESS_CALC_ALIGNMENT | TLB_REQUEST          | 测试是否能正确发起TLB请求`io.tlb.req`。                            |
-| 1.1.4 | ADDRESS_CALC_ALIGNMENT | MASK_GENERATION      | 测试mask是否正确生成并输出至StoreQueue。                             |
-| 1.1.5 | ADDRESS_CALC_ALIGNMENT | S0_MASK_OUT          | 测试s0_mask_out信号是否被正确输出。                                  |
-| 1.2.1 | TLB_RAW_VIOLATION      | TLB_RESPONSE         | 测试TLB响应是否正确写入StoreQueue。                                  |
-| 1.2.2 | TLB_RAW_VIOLATION      | RAW_DETECTION        | 测试是否能正确检测到RAW违例并发出相关信号。                          |
-| 1.2.3 | TLB_RAW_VIOLATION      | ISSUE_SIGNAL         | 测试TLB命中时是否能正确发出issue信号`io.issue`。                  |
-| 1.3.1 | EXCEPTION_FEEDBACK     | PMP_EXCEPTION        | 测试PMP检查结果是否能正确更新至ROB。                                 |
-| 1.3.2 | EXCEPTION_FEEDBACK     | TLB_MISS_FEEDBACK    | 测试TLB miss反馈是否正确发送至RS`feedback_slow`。                  |
-| 1.3.3 | EXCEPTION_FEEDBACK     | LSQ_UPDATE           | 测试是否能将其他相关信息正确写入LSQ。                                |
-| 1.4.1 | SYNCHRONIZATION        | RAW_SYNC             | 测试与RAW违例检测的同步是否正常进行。                                |
-| 1.5.1 | WRITEBACK              | STORE_WRITEBACK      | 测试store结果是否能正确写回后端`stout`。                          |
-| 2.1.1 | VECTOR_STORE           | VECSTIN_REQUEST      | 测试是否能正确接收来自VecStIn通道的请求。                           |
-| 2.2.1 | VECTOR_STORE           | VECTOR_OFFSET_CALC   | 测试向量偏移是否能正确计算`vecVaddrOffset`。   |
-| 2.2.2 | VECTOR_STORE           | LSQ_WRITE            | 测试是否能将store数据正确写入LSQ。                                   |
-| 2.3.1 | VECTOR_STORE           | FEEDBACK_IGNORE      | 测试是否忽略向后端RS发送的反馈信息。                                 |
-| 2.4.1 | VECTOR_STORE           | VECSTORE_WRITEBACK   | 测试向量store结果是否能正确写回`vecstout`。                     |
-| 3.1.1 | MISALIGN_STORE         | MISALIGN_REQUEST     | 测试MisalignBuffer是否能正确处理非对齐请求。                         |
-| 3.2.1 | MISALIGN_STORE         | MISALIGN_BUFFER_ENTRY| 测试非对齐请求是否会正确进入MisalignBuffer（未跨16B边界的请求）。    |
-| 3.2.2 | MISALIGN_STORE         | MISALIGN_TLB_MISS    | 测试MisalignBuffer中的请求在TLB miss时是否会重新发起请求。          |
-| 3.2.3 | MISALIGN_STORE         | MISALIGN_WRITEBACK   | 测试MisalignBuffer中的请求是否能正确发起写回。                       |
+| 1.1 | SU_DISPATCH | SCALAR_DISPATCH  | 验证标量Store指令派发时分配一个StoreQueue条目。|
+| 1.2 |SU_DISPATCH | VECTOR_DISPATCH | 验证向量Store指令的一个uop分配多个LSQ条目（根据元素数量）。|
+| 2.1 | SU_STORE  | S0_ADDRESS_CALC |验证s0阶段地址计算和仲裁是否按三类指令优先级排序。|
+| 2.2 | SU_STORE  | S1_RAW_CHECK|验证s1阶段RAW冒险检测发生。|
+| 2.3 | SU_STORE  | S2_SQ_MARK_READY |验证s2阶段StoreQueue地址就绪标记。|
+| 3.1 | SU_VECTOR  | SPLIT |验证向量指令拆分正确性。|
+| 3.2 | SU_VECTOR  | OFFSET |验证向量元素偏移地址计算。|
+| 4 |  SU_REPLAY | TLB_MISS  | 验证TLB缺失时Store指令重发。 |
+| 5.1 | SU_RAW  | VIOLATION |验证RAW违例检测。|
+| 5.2 | SU_RAW  | RECOVERY_MECH |验证检测到RAW违例后的恢复（流水线清空）。|
+| 6.1 | SU_SBUFFER  | WRITE_MERGE|验证同一缓存块的多个Store在SBuffer中合并。|
+| 6.2 | SU_SBUFFER  | 	PLRU_REPLACE |验证SBuffer满时按PLRU策略替换。|
+| 7.1 | SU_MMIO  | ORDER |验证MMIO指令强顺序执行（成为ROB头）。|
+| 7.2 | SU_MMIO  | EXCEPTION |验证原子/向量指令访问MMIO触发异常。|
+| 8.1 | SU_NC | EXEC |验证NC访问允许乱序执行。|
+| 8.2 | SU_NC  | FORWARD |验证Uncache模块的Store到Load转发。|
+| 9.1 | SU_MISALIGN  | SCALAR_SPLIT |验证标量非对齐访问跨越16B边界时拆分为两个对齐访问。|
+| 9.2 | SU_MISALIGN  | SEG_HANDLE |验证向量Segment指令的非对齐处理（独立路径）。|
+| 9.3 | SU_MISALIGN  | EXCEPTION |验证原子指令、MMIO、NC空间非对齐访问触发异常。|
+| 10.1 | SU_ATOMIC  | PRELOAD |验证原子指令先将缓存块读入DCache。|
+| 10.2 | SU_ATOMIC  | OPS |验证原子操作（如AMO）执行正确性。|
 
 </mrs-testpoints>
-
-## 附录
-
 
